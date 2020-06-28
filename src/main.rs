@@ -22,7 +22,9 @@ const FPS: u64 = 15;
 const UPS: u64 = 15;
 const WINDOW_SIZE: (usize, usize) = (200, 200);
 const PIXEL_SIZE: u32 = 2;
-const NUM_SAMPLES: usize = 16384; // at 44khz, this is ~0.3s
+
+const STORE_SAMPLES: usize = 16384; // at 44khz, this is ~372ms
+const REACT_SAMPLES: usize = 512; // at 44khz, this is ~11ms
 
 type FftOutput = Vec<f32>;
 
@@ -32,7 +34,7 @@ struct AudioThread {
 
 impl AudioThread {
     pub fn new() -> Result<Self, anyhow::Error> {
-        let receiver = Arc::new(RwLock::new(vec![0.0; NUM_SAMPLES]));
+        let receiver = Arc::new(RwLock::new(vec![0.0; STORE_SAMPLES]));
         let c_receiver = receiver.clone();
 
         let host = cpal::default_host();
@@ -53,8 +55,10 @@ impl AudioThread {
 
     fn audio_thread(event_loop: EventLoop, receiver: Arc<RwLock<FftOutput>>) {
         let mut planner: FFTplanner<f32> = FFTplanner::new(false);
-        let fft = planner.plan_fft(NUM_SAMPLES);
-        let mut samples: Vec<f32> = Vec::with_capacity(NUM_SAMPLES);
+        let fft = planner.plan_fft(STORE_SAMPLES);
+        let mut samples: Vec<f32> = vec![0f32; STORE_SAMPLES];
+        let mut idx = 0;
+        let mut react = 0;
 
         event_loop.run(move |stream_id, stream_result| {
             // react to stream events and read or write stream data here
@@ -92,13 +96,29 @@ impl AudioThread {
             };
 
             for b in new_samples {
-                samples.push(b);
+                samples[idx] = b;
+                idx += 1;
+                idx %= STORE_SAMPLES;
+
+                react += 1;
+                react %= REACT_SAMPLES;
+
+                if react == 0 {
+                    // it's time to send an fft! the pointer is probably in the
+                    // middle of the sample buffer but that represents a
+                    // discontinuity so we actually need to chain the
+                    // before/after bits
+                    let it = samples[idx..].iter().chain(samples[..idx].iter());
+                    Self::send_fft(it.copied(), &fft, &receiver);
+                }
+
+                /*samples.push(b);
 
                 if samples.len() >= NUM_SAMPLES {
                     Self::send_fft(samples.iter().copied(), &fft, &receiver);
 
                     samples.truncate(0); // leaves the allocation though
-                }
+                }*/
             }
         });
     }
@@ -108,14 +128,14 @@ impl AudioThread {
         fft: &Arc<dyn FFT<f32>>,
         receiver: &Arc<RwLock<FftOutput>>,
     ) {
-        let mut fft_output: Vec<Complex32> = vec![Zero::zero(); NUM_SAMPLES];
+        let mut fft_output: Vec<Complex32> = vec![Zero::zero(); STORE_SAMPLES];
 
         let hammed = samples.enumerate().map(|(i, dp)| {
             // https://en.wikipedia.org/wiki/Window_function#Hann_and_Hamming_windows
             const A0: f32 = 0.53836;
             const TAU: f32 = f32_consts::PI * 2.0;
             dp * (A0
-                - ((1.0 - A0) * f32::cos(TAU * i as f32 / NUM_SAMPLES as f32)))
+                - ((1.0 - A0) * f32::cos(TAU * i as f32 / STORE_SAMPLES as f32)))
         });
 
         let as_complex = hammed.map(|c| Complex32::new(c, 0.0));
@@ -152,10 +172,10 @@ impl App {
 
             for (i, dp) in data.iter().enumerate() {
                 let col = (i as f64 / data.len() as f64) * cols as f64;
-                // let depth = *dp as f64 * rows as f64;
+                let depth = *dp as f64 * rows as f64;
 
-                let depth =
-                    rescale(*dp, (-1f32, 1f32), (0.0f32, rows as f32)) as f64;
+                //let depth =
+                //    rescale(*dp, (-1f32, 1f32), (0.0f32, rows as f32)) as f64;
                 let blueness = rescale(*dp, (-1f32, 1f32), (0f32, 1f32));
 
                 let colour = [0.0, 0.0, blueness, 1.0];
@@ -205,13 +225,26 @@ where
     F: Into<f32> + Copy,
     T: Into<f32> + From<f32> + Copy,
 {
+    // 0, 10
     let (from_min, from_max) = from_range;
-    let (to_min, to_max) = to_range;
-
+    // 10
     let from_span: f32 = from_max.into() - from_min.into();
+
+    // (5 - 0) / 10 == 0.5
     let percent: f32 = (num.into() - from_min.into()) / from_span;
 
+    // -1, 1
+    let (to_min, to_max) = to_range;
+    // 2.0
     let to_span: f32 = to_max.into() - to_min.into();
 
+    // 0.5 * 2 + -1 == 0
     (percent * to_span + to_min.into()).into()
+}
+
+#[test]
+fn test_rescale() {
+    assert_eq!(rescale(5u8, (0u8, 10u8), (-1f32, 1f32)), 0.0f32);
+    assert_eq!(rescale(0.5, (-1f32, 1f32), (0f32, 1f32)), 0.75f32);
+    assert_eq!(rescale(0.5, (-1f32, 1f32), (0f32, 200f32)), 150);
 }
