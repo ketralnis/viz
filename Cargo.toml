@@ -1,0 +1,18 @@
+[package]
+name = "viz"
+version = "0.1.0"
+authors = ["David King <dking@ketralnis.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+cpal = "0.11"
+anyhow = "*"
+rustfft = "3.0.1"
+num-complex = "0.2.3"
+
+piston = "0.50.0"
+piston2d-graphics = "*"
+piston2d-opengl_graphics = "0.72.0"
+pistoncore-glutin_window = "0.64.0"
