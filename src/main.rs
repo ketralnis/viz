@@ -12,16 +12,19 @@ use rustfft::num_complex::Complex32;
 use rustfft::num_traits::Zero;
 use rustfft::FFTplanner;
 
+use std::f32::consts as f32_consts;
 use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
+use std::sync::{RwLock};
 use std::thread;
 
-const GRAPHICS_HZ: u64 = 15;
+const FPS: u64 = 15;
+const UPS: u64 = 100;
 const WINDOW_SIZE: (usize, usize) = (200, 200);
 const PIXEL_SIZE: u32 = 2;
-const NUM_SAMPLES: usize = 16384;
+const NUM_SAMPLES: usize = 16384; // at 44khz, this is ~0.3s
 
 struct AudioThread {
-    receiver: Receiver<Vec<f32>>,
+    receiver: RwLock<Vec<u32>>
 }
 
 impl AudioThread {
@@ -35,7 +38,7 @@ impl AudioThread {
         let event_loop = host.event_loop();
         let format = device.default_input_format()?;
         let _stream_id = event_loop.build_input_stream(&device, &format);
-        let mut rb: Vec<Complex32> = Vec::with_capacity(NUM_SAMPLES);
+        let mut samples: Vec<f32> = Vec::with_capacity(NUM_SAMPLES);
         let mut planner: FFTplanner<f32> = FFTplanner::new(false);
         let fft = planner.plan_fft(NUM_SAMPLES);
 
@@ -68,16 +71,34 @@ impl AudioThread {
                     }
                 };
                 for b in bytes {
-                    rb.push(Complex32::new(b, 0.0));
+                    samples.push(b);
 
-                    if rb.len() >= NUM_SAMPLES {
+                    if samples.len() >= NUM_SAMPLES {
                         let mut fft_output: Vec<Complex32> =
                             vec![Zero::zero(); NUM_SAMPLES];
-                        fft.process(&mut rb, &mut fft_output);
+
+                        // https://en.wikipedia.org/wiki/Window_function#Hann_and_Hamming_windows
+                        const A0: f32 = 0.53836;
+                        let hammed =
+                            samples.iter().enumerate().map(|(i, dp)| {
+                                const TAU: f32 = f32_consts::PI * 2.0;
+                                *dp * (A0
+                                    - ((1.0 - A0)
+                                        * f32::cos(
+                                            TAU * i as f32 / NUM_SAMPLES as f32,
+                                        )))
+                            });
+
+                        let as_complex = hammed.map(|c| Complex32::new(c, 0.0));
+                        let mut fft_samples: Vec<Complex32> =
+                            as_complex.collect();
+                        fft.process(&mut fft_samples, &mut fft_output);
+
                         let as_reals: Vec<f32> =
                             fft_output.iter().map(|cm| cm.re).collect();
                         producer.send(as_reals).expect("failed to send");
-                        rb.truncate(0);
+
+                        samples.truncate(0); // leaves the allocation though
                     }
                 }
             });
@@ -117,11 +138,6 @@ impl App {
             match fft_output {
                 Some(data) if data.len() > 0 => {
                     let samples = data.len() as f32;
-                    let max =
-                        data.iter().cloned().fold(0.0, f32::max) / samples;
-                    let min =
-                        data.iter().cloned().fold(0.0, f32::min) / samples;
-
                     for (i, dp) in data.iter().enumerate() {
                         let row = (i / rows) as u32 / PIXEL_SIZE;
                         let col = (i % cols) as u32 / PIXEL_SIZE;
@@ -176,8 +192,8 @@ fn main() -> Result<(), anyhow::Error> {
     let mut app = App::new(GlGraphics::new(opengl), audio_thread);
 
     let mut settings = EventSettings::new();
-    settings.max_fps = GRAPHICS_HZ;
-    settings.ups = GRAPHICS_HZ;
+    settings.max_fps = FPS;
+    settings.ups = UPS;
     let mut events = Events::new(settings);
     // handle UI events on the main thread
     while let Some(e) = events.next(&mut window) {
@@ -202,8 +218,3 @@ fn rescale(num: f32, from_range: (f32, f32), to_range: (f32, f32)) -> f32 {
     let to_span = to_max - to_min;
     percent * to_span + to_min
 }
-
-/*hamming_window
-for(int i = 0; i < SEGMENTATION_LENGTH;i++){
-    timeDomain[i] = (float) (( 0.53836 - ( 0.46164 * Math.cos( TWOPI * (double)i  / (double)( SEGMENTATION_LENGTH - 1 ) ) ) ) * frameBuffer[i]);
-}*/
