@@ -1,8 +1,9 @@
 use anyhow;
 use cpal;
 use cpal::traits::{DeviceTrait, EventLoopTrait, HostTrait};
-use cpal::{StreamData, UnknownTypeInputBuffer};
+use cpal::{EventLoop, StreamData, UnknownTypeInputBuffer};
 use glutin_window::GlutinWindow as Window;
+use graphics::types::Rectangle;
 use graphics::{self, Transformed};
 use opengl_graphics::{GlGraphics, OpenGL};
 use piston::event_loop::{EventSettings, Events};
@@ -11,25 +12,28 @@ use piston::window::WindowSettings;
 use rustfft::num_complex::Complex32;
 use rustfft::num_traits::Zero;
 use rustfft::FFTplanner;
+use rustfft::FFT;
 
 use std::f32::consts as f32_consts;
-use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
-use std::sync::{RwLock};
+use std::sync::{Arc, RwLock};
 use std::thread;
 
 const FPS: u64 = 15;
-const UPS: u64 = 100;
+const UPS: u64 = 15;
 const WINDOW_SIZE: (usize, usize) = (200, 200);
 const PIXEL_SIZE: u32 = 2;
 const NUM_SAMPLES: usize = 16384; // at 44khz, this is ~0.3s
 
+type FftOutput = Vec<f32>;
+
 struct AudioThread {
-    receiver: RwLock<Vec<u32>>
+    receiver: Arc<RwLock<FftOutput>>,
 }
 
 impl AudioThread {
     pub fn new() -> Result<Self, anyhow::Error> {
-        let (producer, receiver) = sync_channel(1);
+        let receiver = Arc::new(RwLock::new(vec![0.0; NUM_SAMPLES]));
+        let c_receiver = receiver.clone();
 
         let host = cpal::default_host();
         let device = host
@@ -37,146 +41,134 @@ impl AudioThread {
             .expect("no default audio device");
         let event_loop = host.event_loop();
         let format = device.default_input_format()?;
+        println!("format: {:?}", format);
         let _stream_id = event_loop.build_input_stream(&device, &format);
-        let mut samples: Vec<f32> = Vec::with_capacity(NUM_SAMPLES);
-        let mut planner: FFTplanner<f32> = FFTplanner::new(false);
-        let fft = planner.plan_fft(NUM_SAMPLES);
 
         thread::spawn(move || {
-            event_loop.run(move |stream_id, stream_result| {
-                // react to stream events and read or write stream data here
-                let stream_data = match stream_result {
-                    Ok(data) => data,
-                    Err(err) => {
-                        eprintln!(
-                            "an error occurred on stream {:?}: {}",
-                            stream_id, err
-                        );
-                        return;
-                    }
-                };
-
-                let bytes: Vec<f32> = match stream_data {
-                    StreamData::Input {
-                        buffer: UnknownTypeInputBuffer::U16(buf),
-                    } => buf.iter().map(|b| *b as f32).collect(),
-                    StreamData::Input {
-                        buffer: UnknownTypeInputBuffer::I16(buf),
-                    } => buf.iter().map(|b| *b as f32).collect(),
-                    StreamData::Input {
-                        buffer: UnknownTypeInputBuffer::F32(buf),
-                    } => buf.iter().map(|b| *b as f32).collect(),
-                    StreamData::Output { .. } => {
-                        unreachable!("got output data?")
-                    }
-                };
-                for b in bytes {
-                    samples.push(b);
-
-                    if samples.len() >= NUM_SAMPLES {
-                        let mut fft_output: Vec<Complex32> =
-                            vec![Zero::zero(); NUM_SAMPLES];
-
-                        // https://en.wikipedia.org/wiki/Window_function#Hann_and_Hamming_windows
-                        const A0: f32 = 0.53836;
-                        let hammed =
-                            samples.iter().enumerate().map(|(i, dp)| {
-                                const TAU: f32 = f32_consts::PI * 2.0;
-                                *dp * (A0
-                                    - ((1.0 - A0)
-                                        * f32::cos(
-                                            TAU * i as f32 / NUM_SAMPLES as f32,
-                                        )))
-                            });
-
-                        let as_complex = hammed.map(|c| Complex32::new(c, 0.0));
-                        let mut fft_samples: Vec<Complex32> =
-                            as_complex.collect();
-                        fft.process(&mut fft_samples, &mut fft_output);
-
-                        let as_reals: Vec<f32> =
-                            fft_output.iter().map(|cm| cm.re).collect();
-                        producer.send(as_reals).expect("failed to send");
-
-                        samples.truncate(0); // leaves the allocation though
-                    }
-                }
-            });
+            Self::audio_thread(event_loop, c_receiver);
         });
 
         Ok(Self { receiver })
+    }
+
+    fn audio_thread(event_loop: EventLoop, receiver: Arc<RwLock<FftOutput>>) {
+        let mut planner: FFTplanner<f32> = FFTplanner::new(false);
+        let fft = planner.plan_fft(NUM_SAMPLES);
+        let mut samples: Vec<f32> = Vec::with_capacity(NUM_SAMPLES);
+
+        event_loop.run(move |stream_id, stream_result| {
+            // react to stream events and read or write stream data here
+            let stream_data = match stream_result {
+                Ok(data) => data,
+                Err(err) => {
+                    eprintln!(
+                        "an error occurred on stream {:?}: {}",
+                        stream_id, err
+                    );
+                    return;
+                }
+            };
+
+            // https://docs.rs/cpal/0.8.2/cpal/enum.SampleFormat.html
+            let new_samples: Vec<f32> = match stream_data {
+                StreamData::Input {
+                    buffer: UnknownTypeInputBuffer::U16(buf),
+                } => buf
+                    .iter()
+                    .map(|b| rescale(*b, (0u16, 65535u16), (-1.0f32, 1.0f32)))
+                    .collect(),
+                StreamData::Input {
+                    buffer: UnknownTypeInputBuffer::I16(buf),
+                } => buf
+                    .iter()
+                    .map(|b| {
+                        rescale(*b, (i16::MIN, i16::MAX), (-1.0f32, 1.0f32))
+                    })
+                    .collect(),
+                StreamData::Input {
+                    buffer: UnknownTypeInputBuffer::F32(buf),
+                } => buf.iter().map(|b| *b as f32).collect(),
+                StreamData::Output { .. } => unreachable!("got output data?"),
+            };
+
+            for b in new_samples {
+                samples.push(b);
+
+                if samples.len() >= NUM_SAMPLES {
+                    Self::send_fft(samples.iter().copied(), &fft, &receiver);
+
+                    samples.truncate(0); // leaves the allocation though
+                }
+            }
+        });
+    }
+
+    fn send_fft(
+        samples: impl Iterator<Item = f32>,
+        fft: &Arc<dyn FFT<f32>>,
+        receiver: &Arc<RwLock<FftOutput>>,
+    ) {
+        let mut fft_output: Vec<Complex32> = vec![Zero::zero(); NUM_SAMPLES];
+
+        let hammed = samples.enumerate().map(|(i, dp)| {
+            // https://en.wikipedia.org/wiki/Window_function#Hann_and_Hamming_windows
+            const A0: f32 = 0.53836;
+            const TAU: f32 = f32_consts::PI * 2.0;
+            dp * (A0
+                - ((1.0 - A0) * f32::cos(TAU * i as f32 / NUM_SAMPLES as f32)))
+        });
+
+        let as_complex = hammed.map(|c| Complex32::new(c, 0.0));
+        let mut fft_samples: Vec<Complex32> = as_complex.collect();
+        fft.process(&mut fft_samples, &mut fft_output);
+
+        let normalised = fft_output.iter().map(|cm| cm.re).collect::<Vec<_>>();
+
+        let mut lock = receiver.write().expect("failed writer lock");
+        lock[..].clone_from_slice(&normalised);
+        drop(lock);
     }
 }
 
 pub struct App {
     gl: GlGraphics,
     audio_thread: AudioThread,
-    fft_output: Option<Vec<f32>>,
 }
 
 impl App {
     fn new(gl: GlGraphics, audio_thread: AudioThread) -> Self {
-        Self {
-            gl,
-            audio_thread,
-            fft_output: None,
-        }
+        Self { gl, audio_thread }
     }
 
     fn render(&mut self, args: RenderArgs) {
-        let fft_output = &self.fft_output.as_ref();
-        self.gl.draw(args.viewport(), |c, gl| {
+        let data = self.audio_thread.receiver.read().expect("read lock");
+
+        let vp = args.viewport();
+        self.gl.draw(vp, |c, gl| {
             const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
-
             graphics::clear(BLACK, gl);
-
-            let square =
-                graphics::rectangle::square(0.0, 0.0, PIXEL_SIZE as f64);
 
             let (rows, cols) = WINDOW_SIZE;
 
-            match fft_output {
-                Some(data) if data.len() > 0 => {
-                    let samples = data.len() as f32;
-                    for (i, dp) in data.iter().enumerate() {
-                        let row = (i / rows) as u32 / PIXEL_SIZE;
-                        let col = (i % cols) as u32 / PIXEL_SIZE;
+            for (i, dp) in data.iter().enumerate() {
+                let col = (i as f64 / data.len() as f64) * cols as f64;
+                // let depth = *dp as f64 * rows as f64;
 
-                        let transform = c.transform.trans(
-                            col as f64 * PIXEL_SIZE as f64,
-                            row as f64 * PIXEL_SIZE as f64,
-                        );
-                        let blueness = *dp;
-                        let colour = [0.0, 0.0, blueness, 1.0];
-                        graphics::rectangle(colour, square, transform, gl);
-                    }
-                }
+                let depth =
+                    rescale(*dp, (-1f32, 1f32), (0.0f32, rows as f32)) as f64;
+                let blueness = rescale(*dp, (-1f32, 1f32), (0f32, 1f32));
 
-                // we don't have data
-                _ => (),
+                let colour = [0.0, 0.0, blueness, 1.0];
+                let line = [0.0, col, depth, col];
+                graphics::line(colour, 1.0, line, c.transform, gl)
             }
         });
     }
 
-    fn update(&mut self, _args: UpdateArgs) {
-        loop {
-            match self.audio_thread.receiver.try_recv() {
-                Ok(data) => self.fft_output = Some(data),
-                Err(TryRecvError::Empty) => {
-                    // it's not ready for us
-                    return;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    panic!("audio thread hung up")
-                }
-            }
-        }
-    }
+    fn update(&mut self, _args: UpdateArgs) {}
 }
 
 fn main() -> Result<(), anyhow::Error> {
-    println!("Hello, world!");
-
     let (row_px, col_px) = WINDOW_SIZE;
 
     let audio_thread = AudioThread::new()?;
@@ -208,13 +200,18 @@ fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn rescale(num: f32, from_range: (f32, f32), to_range: (f32, f32)) -> f32 {
+fn rescale<F, T>(num: F, from_range: (F, F), to_range: (T, T)) -> T
+where
+    F: Into<f32> + Copy,
+    T: Into<f32> + From<f32> + Copy,
+{
     let (from_min, from_max) = from_range;
     let (to_min, to_max) = to_range;
 
-    let from_span = from_max - from_min;
-    let percent = (num - from_min) / from_span;
+    let from_span: f32 = from_max.into() - from_min.into();
+    let percent: f32 = (num.into() - from_min.into()) / from_span;
 
-    let to_span = to_max - to_min;
-    percent * to_span + to_min
+    let to_span: f32 = to_max.into() - to_min.into();
+
+    (percent * to_span + to_min.into()).into()
 }
