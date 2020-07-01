@@ -1,10 +1,8 @@
 use anyhow;
-use cpal;
 use cpal::traits::{DeviceTrait, EventLoopTrait, HostTrait};
 use cpal::{EventLoop, StreamData, UnknownTypeInputBuffer};
 use glutin_window::GlutinWindow as Window;
-use graphics::types::Rectangle;
-use graphics::{self, Transformed};
+use graphics;
 use opengl_graphics::{GlGraphics, OpenGL};
 use piston::event_loop::{EventSettings, Events};
 use piston::input::{RenderArgs, RenderEvent, UpdateArgs, UpdateEvent};
@@ -15,18 +13,39 @@ use rustfft::FFTplanner;
 use rustfft::FFT;
 
 use std::f32::consts as f32_consts;
+use std::fmt::Debug;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
 const FPS: u64 = 15;
 const UPS: u64 = 15;
-const WINDOW_SIZE: (usize, usize) = (200, 200);
-const PIXEL_SIZE: u32 = 2;
+const WINDOW_SIZE: (usize, usize) = (640, 480);
 
 const STORE_SAMPLES: usize = 16384; // at 44khz, this is ~372ms
-const REACT_SAMPLES: usize = 512; // at 44khz, this is ~11ms
 
-type FftOutput = Vec<f32>;
+// for a real input signal (imaginary parts all zero) the second half of the FFT
+// (bins from N / 2 + 1 to N - 1) contain no useful additional information (they
+// have complex conjugate symmetry with the first N / 2 - 1 bins). The last
+// useful bin (for practical aplications) is at N / 2 - 1
+const FFT_SIZE: usize = STORE_SAMPLES / 2 - 1;
+
+// how often to rerun the fft
+const REACT_SAMPLES: u32 = 512; // at 44khz, this is ~11ms
+
+#[derive(Debug)]
+struct FftOutput {
+    samples: Vec<f32>,
+    fft: Vec<f32>,
+}
+
+impl FftOutput {
+    fn new() -> Self {
+        Self {
+            samples: vec![0.0; STORE_SAMPLES],
+            fft: vec![0.0; FFT_SIZE],
+        }
+    }
+}
 
 struct AudioThread {
     receiver: Arc<RwLock<FftOutput>>,
@@ -34,7 +53,7 @@ struct AudioThread {
 
 impl AudioThread {
     pub fn new() -> Result<Self, anyhow::Error> {
-        let receiver = Arc::new(RwLock::new(vec![0.0; STORE_SAMPLES]));
+        let receiver = Arc::new(RwLock::new(FftOutput::new()));
         let c_receiver = receiver.clone();
 
         let host = cpal::default_host();
@@ -55,7 +74,7 @@ impl AudioThread {
 
     fn audio_thread(event_loop: EventLoop, receiver: Arc<RwLock<FftOutput>>) {
         let mut planner: FFTplanner<f32> = FFTplanner::new(false);
-        let fft = planner.plan_fft(STORE_SAMPLES);
+        let fft_planner = planner.plan_fft(STORE_SAMPLES);
         let mut samples: Vec<f32> = vec![0f32; STORE_SAMPLES];
         let mut idx = 0;
         let mut react = 0;
@@ -79,7 +98,9 @@ impl AudioThread {
                     buffer: UnknownTypeInputBuffer::U16(buf),
                 } => buf
                     .iter()
-                    .map(|b| rescale(*b, (0u16, 65535u16), (-1.0f32, 1.0f32)))
+                    .map(|b| {
+                        rescale(*b, (u16::MIN, u16::MAX), (-1.0f32, 1.0f32))
+                    })
                     .collect(),
                 StreamData::Input {
                     buffer: UnknownTypeInputBuffer::I16(buf),
@@ -108,44 +129,55 @@ impl AudioThread {
                     // middle of the sample buffer but that represents a
                     // discontinuity so we actually need to chain the
                     // before/after bits
-                    let it = samples[idx..].iter().chain(samples[..idx].iter());
-                    Self::send_fft(it.copied(), &fft, &receiver);
+                    let it: Vec<f32> = samples[idx..]
+                        .iter()
+                        .chain(samples[..idx].iter())
+                        .copied()
+                        .collect();
+                    let computed =
+                        Self::compute_fft(it, &fft_planner);
+                    Self::send_fft(computed, &receiver);
                 }
-
-                /*samples.push(b);
-
-                if samples.len() >= NUM_SAMPLES {
-                    Self::send_fft(samples.iter().copied(), &fft, &receiver);
-
-                    samples.truncate(0); // leaves the allocation though
-                }*/
             }
         });
     }
 
-    fn send_fft(
-        samples: impl Iterator<Item = f32>,
-        fft: &Arc<dyn FFT<f32>>,
-        receiver: &Arc<RwLock<FftOutput>>,
-    ) {
-        let mut fft_output: Vec<Complex32> = vec![Zero::zero(); STORE_SAMPLES];
-
-        let hammed = samples.enumerate().map(|(i, dp)| {
+    fn compute_fft<'a>(
+        samples: Vec<f32>,
+        fft_planner: &'a Arc<dyn FFT<f32>>,
+    ) -> FftOutput {
+        let hammed = samples.iter().enumerate().map(|(i, dp)| {
             // https://en.wikipedia.org/wiki/Window_function#Hann_and_Hamming_windows
             const A0: f32 = 0.53836;
             const TAU: f32 = f32_consts::PI * 2.0;
-            dp * (A0
-                - ((1.0 - A0) * f32::cos(TAU * i as f32 / STORE_SAMPLES as f32)))
+            *dp * (A0
+                - ((1.0 - A0) * f32::cos(TAU * i as f32 / samples.len() as f32)))
         });
 
         let as_complex = hammed.map(|c| Complex32::new(c, 0.0));
         let mut fft_samples: Vec<Complex32> = as_complex.collect();
-        fft.process(&mut fft_samples, &mut fft_output);
+        let mut fft_output: Vec<Complex32> =
+            vec![Zero::zero(); fft_samples.len()];
+        fft_planner.process(&mut fft_samples, &mut fft_output);
 
-        let normalised = fft_output.iter().map(|cm| cm.re).collect::<Vec<_>>();
+        fft_output.truncate(FFT_SIZE);
 
+        let fft = fft_output
+            .iter()
+            .map(|elem| {
+                // normalise it
+                let amplitude = elem.norm_sqr().sqrt();
+                let normal = amplitude / (samples.len() as f32).sqrt();
+                normal
+            })
+            .collect();
+
+        FftOutput { samples, fft }
+    }
+
+    fn send_fft(output: FftOutput, receiver: &Arc<RwLock<FftOutput>>) {
         let mut lock = receiver.write().expect("failed writer lock");
-        lock[..].clone_from_slice(&normalised);
+        *lock = output;
         drop(lock);
     }
 }
@@ -161,25 +193,52 @@ impl App {
     }
 
     fn render(&mut self, args: RenderArgs) {
-        let data = self.audio_thread.receiver.read().expect("read lock");
-
+        // we want to let go of that lock as fast as possible, so compute the
+        // lines we need to draw and then release it while we draw them
         let vp = args.viewport();
+        let (height, width) = (vp.draw_size[1], vp.draw_size[0]);
+        let lines: Vec<([f32; 4], [f64; 4])> = {
+            let data = self.audio_thread.receiver.read().expect("read lock");
+
+            let fft_lines = data.fft[1..].iter().enumerate().map(|(i, dp)| {
+                // TODO resize fft output so we can draw fewer of these
+                // lines. we're trying to draw 16k lines in the 1k-ish
+                // pixels we have
+                let col = rescale(
+                    i as f32,
+                    (0f32, data.fft.len() as f32 - 1f32),
+                    (0f32, width as f32),
+                ) as f64;
+                // TODO why does this routinely fall out of the drawable space?
+                let depth =
+                    rescale(*dp, (0f32, 1f32), (0f32, height as f32)) as f64;
+                let colour = [0.0, 0.0, 1.0, 1.0];
+                let line = [col, 0.0, col, depth];
+                (colour, line)
+            });
+
+            let sample_lines =
+                data.samples.iter().enumerate().map(|(i, dp)| {
+                    let col = rescale(
+                        i as f32,
+                        (0f32, data.samples.len() as f32 - 1f32),
+                        (0f32, width as f32),
+                    ) as f64;
+                    let depth =
+                        rescale(*dp, (-1f32, 1f32), (0f32, height as f32))
+                            as f64;
+                    let colour = [1.0, 0.0, 0.0, 1.0];
+                    let line = [col, height as f64 - depth, col, height as f64];
+                    (colour, line)
+                });
+
+            fft_lines.chain(sample_lines).collect()
+        };
+
         self.gl.draw(vp, |c, gl| {
             const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
             graphics::clear(BLACK, gl);
-
-            let (rows, cols) = WINDOW_SIZE;
-
-            for (i, dp) in data.iter().enumerate() {
-                let col = (i as f64 / data.len() as f64) * cols as f64;
-                let depth = *dp as f64 * rows as f64;
-
-                //let depth =
-                //    rescale(*dp, (-1f32, 1f32), (0.0f32, rows as f32)) as f64;
-                let blueness = rescale(*dp, (-1f32, 1f32), (0f32, 1f32));
-
-                let colour = [0.0, 0.0, blueness, 1.0];
-                let line = [0.0, col, depth, col];
+            for (colour, line) in lines {
                 graphics::line(colour, 1.0, line, c.transform, gl)
             }
         });
@@ -195,7 +254,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     let opengl = OpenGL::V3_2;
     let mut window: Window =
-        WindowSettings::new("noise", [col_px as u32, row_px as u32])
+        WindowSettings::new("noise", [row_px as u32, col_px as u32])
             .graphics_api(opengl)
             .exit_on_esc(true)
             .build()
@@ -222,29 +281,32 @@ fn main() -> Result<(), anyhow::Error> {
 
 fn rescale<F, T>(num: F, from_range: (F, F), to_range: (T, T)) -> T
 where
-    F: Into<f32> + Copy,
-    T: Into<f32> + From<f32> + Copy,
+    F: Into<f32> + Copy + PartialOrd + Debug,
+    T: Into<f32> + From<f32> + Copy + Debug,
 {
-    // 0, 10
     let (from_min, from_max) = from_range;
-    // 10
     let from_span: f32 = from_max.into() - from_min.into();
 
-    // (5 - 0) / 10 == 0.5
     let percent: f32 = (num.into() - from_min.into()) / from_span;
 
-    // -1, 1
     let (to_min, to_max) = to_range;
-    // 2.0
     let to_span: f32 = to_max.into() - to_min.into();
 
-    // 0.5 * 2 + -1 == 0
-    (percent * to_span + to_min.into()).into()
+    let output = (percent * to_span + to_min.into()).into();
+
+    if cfg!(debug_assertions) && (num < from_min || num > from_max) {
+        eprintln!(
+            "rescale not happy about {:?} < {:?} < {:?} --> {:?} < {:?} < {:?}",
+            from_min, num, from_max, to_min, output, to_max,
+        );
+    }
+
+    output
 }
 
 #[test]
 fn test_rescale() {
     assert_eq!(rescale(5u8, (0u8, 10u8), (-1f32, 1f32)), 0.0f32);
     assert_eq!(rescale(0.5, (-1f32, 1f32), (0f32, 1f32)), 0.75f32);
-    assert_eq!(rescale(0.5, (-1f32, 1f32), (0f32, 200f32)), 150);
+    assert_eq!(rescale(0.5, (-1f32, 1f32), (0f32, 200f32)), 150f32);
 }
