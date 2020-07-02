@@ -14,6 +14,7 @@ use rustfft::FFT;
 
 use std::f32::consts as f32_consts;
 use std::fmt::Debug;
+use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -21,7 +22,7 @@ const FPS: u64 = 15;
 const UPS: u64 = 15;
 const WINDOW_SIZE: (usize, usize) = (640, 480);
 
-const STORE_SAMPLES: usize = 16384; // at 44khz, this is ~372ms
+const STORE_SAMPLES: usize = 32768; // at 44khz, this is ~1300ms
 
 // for a real input signal (imaginary parts all zero) the second half of the FFT
 // (bins from N / 2 + 1 to N - 1) contain no useful additional information (they
@@ -30,7 +31,7 @@ const STORE_SAMPLES: usize = 16384; // at 44khz, this is ~372ms
 const FFT_SIZE: usize = STORE_SAMPLES / 2 - 1;
 
 // how often to rerun the fft
-const REACT_SAMPLES: u32 = 512; // at 44khz, this is ~11ms
+const REACT_SAMPLES: u32 = 512; // at 44khz, this is ~86ms
 
 #[derive(Debug)]
 struct FftOutput {
@@ -65,16 +66,25 @@ impl AudioThread {
         println!("format: {:?}", format);
         let _stream_id = event_loop.build_input_stream(&device, &format);
 
-        thread::spawn(move || {
-            Self::audio_thread(event_loop, c_receiver);
-        });
+        let mut planner: FFTplanner<f32> = FFTplanner::new(false);
+        let fft_planner = planner.plan_fft(STORE_SAMPLES);
+
+        let fft_sender = Self::fft_thread(fft_planner, c_receiver);
+
+        thread::Builder::new()
+            .name("audio thread".into())
+            .spawn(move || {
+                Self::audio_thread(event_loop, fft_sender);
+            })
+            .expect("failed spawn audio thread");
 
         Ok(Self { receiver })
     }
 
-    fn audio_thread(event_loop: EventLoop, receiver: Arc<RwLock<FftOutput>>) {
-        let mut planner: FFTplanner<f32> = FFTplanner::new(false);
-        let fft_planner = planner.plan_fft(STORE_SAMPLES);
+    fn audio_thread(
+        event_loop: EventLoop,
+        fft_sender: mpsc::SyncSender<Vec<f32>>,
+    ) {
         let mut samples: Vec<f32> = vec![0f32; STORE_SAMPLES];
         let mut idx = 0;
         let mut react = 0;
@@ -134,12 +144,31 @@ impl AudioThread {
                         .chain(samples[..idx].iter())
                         .copied()
                         .collect();
-                    let computed =
-                        Self::compute_fft(it, &fft_planner);
-                    Self::send_fft(computed, &receiver);
+                    fft_sender.send(it).expect("fft thread hung up");
                 }
             }
         });
+    }
+
+    fn fft_thread(
+        fft_planner: Arc<dyn FFT<f32>>,
+        receiver: Arc<RwLock<FftOutput>>,
+    ) -> mpsc::SyncSender<Vec<f32>> {
+        // we don't want this to be unbounded. we want the audio thread to block
+        // (and thus miss samples) when we get behind. but we do want them to be
+        // able to run a bit in parallel
+        let (tx, rx) = mpsc::sync_channel(2);
+
+        thread::Builder::new()
+            .name("fft thread".into())
+            .spawn(move || {
+                for samples in rx {
+                    let fft = Self::compute_fft(samples, &fft_planner);
+                    Self::send_fft(fft, &receiver);
+                }
+            })
+            .expect("failed spawn fft thread");
+        tx
     }
 
     fn compute_fft<'a>(
@@ -151,7 +180,8 @@ impl AudioThread {
             const A0: f32 = 0.53836;
             const TAU: f32 = f32_consts::PI * 2.0;
             *dp * (A0
-                - ((1.0 - A0) * f32::cos(TAU * i as f32 / samples.len() as f32)))
+                - ((1.0 - A0)
+                    * f32::cos(TAU * i as f32 / samples.len() as f32)))
         });
 
         let as_complex = hammed.map(|c| Complex32::new(c, 0.0));
@@ -196,7 +226,7 @@ impl App {
         // we want to let go of that lock as fast as possible, so compute the
         // lines we need to draw and then release it while we draw them
         let vp = args.viewport();
-        let (height, width) = (vp.draw_size[1], vp.draw_size[0]);
+        let (height, width) = (vp.window_size[1], vp.window_size[0]);
         let lines: Vec<([f32; 4], [f64; 4])> = {
             let data = self.audio_thread.receiver.read().expect("read lock");
 
@@ -209,9 +239,8 @@ impl App {
                     (0f32, data.fft.len() as f32 - 1f32),
                     (0f32, width as f32),
                 ) as f64;
-                // TODO why does this routinely fall out of the drawable space?
                 let depth =
-                    rescale(*dp, (0f32, 1f32), (0f32, height as f32)) as f64;
+                    rescale(*dp, (0.0, 1.0), (0.0, height as f32)) as f64;
                 let colour = [0.0, 0.0, 1.0, 1.0];
                 let line = [col, 0.0, col, depth];
                 (colour, line)
@@ -221,14 +250,16 @@ impl App {
                 data.samples.iter().enumerate().map(|(i, dp)| {
                     let col = rescale(
                         i as f32,
-                        (0f32, data.samples.len() as f32 - 1f32),
-                        (0f32, width as f32),
+                        (0.0, data.samples.len() as f32 - 1.0),
+                        (0.0, width as f32),
                     ) as f64;
-                    let depth =
-                        rescale(*dp, (-1f32, 1f32), (0f32, height as f32))
-                            as f64;
+                    let row = rescale(
+                        *dp,
+                        (-1.0, 1.0),
+                        (0.0, height as f32),
+                    ) as f64;
                     let colour = [1.0, 0.0, 0.0, 1.0];
-                    let line = [col, height as f64 - depth, col, height as f64];
+                    let line = [col, row, col, height as f64/2.0];
                     (colour, line)
                 });
 
@@ -306,7 +337,8 @@ where
 
 #[test]
 fn test_rescale() {
-    assert_eq!(rescale(5u8, (0u8, 10u8), (-1f32, 1f32)), 0.0f32);
-    assert_eq!(rescale(0.5, (-1f32, 1f32), (0f32, 1f32)), 0.75f32);
+    assert_eq!(rescale(5u8, (0u8, 10u8), (-1f32, 1f32)), 0.0);
+    assert_eq!(rescale(0.5, (-1f32, 1f32), (0f32, 1f32)), 0.75);
     assert_eq!(rescale(0.5, (-1f32, 1f32), (0f32, 200f32)), 150f32);
+    assert_eq!(rescale(0.25, (-1f32, 1f32), (1f32, -1f32)), -0.25);
 }
