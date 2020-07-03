@@ -1,16 +1,15 @@
 use anyhow;
 use cpal::traits::{DeviceTrait, EventLoopTrait, HostTrait};
 use cpal::{EventLoop, StreamData, UnknownTypeInputBuffer};
+use fftw::array::AlignedVec;
+use fftw::plan::{C2CPlan, C2CPlan32};
+use fftw::types::{c32, Flag, Sign};
 use glutin_window::GlutinWindow as Window;
 use graphics;
 use opengl_graphics::{GlGraphics, OpenGL};
 use piston::event_loop::{EventSettings, Events};
 use piston::input::{RenderArgs, RenderEvent, UpdateArgs, UpdateEvent};
 use piston::window::WindowSettings;
-use rustfft::num_complex::Complex32;
-use rustfft::num_traits::Zero;
-use rustfft::FFTplanner;
-use rustfft::FFT;
 
 use std::f32::consts as f32_consts;
 use std::fmt::Debug;
@@ -22,16 +21,17 @@ const FPS: u64 = 15;
 const UPS: u64 = 15;
 const WINDOW_SIZE: (usize, usize) = (640, 480);
 
-const STORE_SAMPLES: usize = 32768; // at 44khz, this is ~1300ms
+const STORE_SAMPLES: usize = 65536; // at 44khz, this is ~743ms
+const FFT_SAMPLES: usize = 16384;
 
 // for a real input signal (imaginary parts all zero) the second half of the FFT
 // (bins from N / 2 + 1 to N - 1) contain no useful additional information (they
 // have complex conjugate symmetry with the first N / 2 - 1 bins). The last
 // useful bin (for practical aplications) is at N / 2 - 1
-const FFT_SIZE: usize = STORE_SAMPLES / 2 - 1;
+const FFT_SIZE: usize = FFT_SAMPLES / 2 - 1;
 
 // how often to rerun the fft
-const REACT_SAMPLES: u32 = 512; // at 44khz, this is ~86ms
+const REACT_SAMPLES: u32 = 512; // at 44khz, this is ~12ms
 
 #[derive(Debug)]
 struct FftOutput {
@@ -66,10 +66,7 @@ impl AudioThread {
         println!("format: {:?}", format);
         let _stream_id = event_loop.build_input_stream(&device, &format);
 
-        let mut planner: FFTplanner<f32> = FFTplanner::new(false);
-        let fft_planner = planner.plan_fft(STORE_SAMPLES);
-
-        let fft_sender = Self::fft_thread(fft_planner, c_receiver);
+        let fft_sender = Self::fft_thread(c_receiver);
 
         thread::Builder::new()
             .name("audio thread".into())
@@ -151,19 +148,32 @@ impl AudioThread {
     }
 
     fn fft_thread(
-        fft_planner: Arc<dyn FFT<f32>>,
         receiver: Arc<RwLock<FftOutput>>,
     ) -> mpsc::SyncSender<Vec<f32>> {
-        // we don't want this to be unbounded. we want the audio thread to block
-        // (and thus miss samples) when we get behind. but we do want them to be
-        // able to run a bit in parallel
+        // we don't want this to be unbounded because we want the audio thread
+        // to block (and thus miss samples) when we get behind. but we do want
+        // them to be able to run a bit in parallel
         let (tx, rx) = mpsc::sync_channel(2);
 
         thread::Builder::new()
             .name("fft thread".into())
             .spawn(move || {
+                let mut input = AlignedVec::new(FFT_SAMPLES);
+                let mut output = AlignedVec::new(FFT_SAMPLES);
+                let mut plan: C2CPlan32 = C2CPlan::aligned(
+                    &[FFT_SAMPLES],
+                    Sign::Forward,
+                    Flag::MEASURE | Flag::DESTROYINPUT,
+                )
+                .expect("couldn't plan fft");
+
                 for samples in rx {
-                    let fft = Self::compute_fft(samples, &fft_planner);
+                    let fft = Self::compute_fft(
+                        &mut input,
+                        &mut output,
+                        samples,
+                        &mut plan,
+                    );
                     Self::send_fft(fft, &receiver);
                 }
             })
@@ -172,33 +182,31 @@ impl AudioThread {
     }
 
     fn compute_fft<'a>(
+        mut input_buffer: &mut AlignedVec<c32>,
+        mut output_buffer: &mut AlignedVec<c32>,
         samples: Vec<f32>,
-        fft_planner: &'a Arc<dyn FFT<f32>>,
+        plan: &mut C2CPlan32,
     ) -> FftOutput {
-        let hammed = samples.iter().enumerate().map(|(i, dp)| {
+        for (i, dp) in samples[STORE_SAMPLES-FFT_SAMPLES..].iter().enumerate() {
             // https://en.wikipedia.org/wiki/Window_function#Hann_and_Hamming_windows
             const A0: f32 = 0.53836;
             const TAU: f32 = f32_consts::PI * 2.0;
-            *dp * (A0
-                - ((1.0 - A0)
-                    * f32::cos(TAU * i as f32 / samples.len() as f32)))
-        });
+            let hammed = dp
+                * (A0
+                    - ((1.0 - A0)
+                        * f32::cos(TAU * i as f32 / FFT_SAMPLES as f32)));
+            input_buffer[i] = c32::new(hammed, 0.0);
+        }
 
-        let as_complex = hammed.map(|c| Complex32::new(c, 0.0));
-        let mut fft_samples: Vec<Complex32> = as_complex.collect();
-        let mut fft_output: Vec<Complex32> =
-            vec![Zero::zero(); fft_samples.len()];
-        fft_planner.process(&mut fft_samples, &mut fft_output);
+        plan.c2c(&mut input_buffer, &mut output_buffer)
+            .expect("failed fft");
 
-        fft_output.truncate(FFT_SIZE);
-
-        let fft = fft_output
+        let fft: Vec<f32> = output_buffer[..FFT_SIZE]
             .iter()
             .map(|elem| {
                 // normalise it
                 let amplitude = elem.norm_sqr().sqrt();
-                let normal = amplitude / (samples.len() as f32).sqrt();
-                normal
+                amplitude / (FFT_SAMPLES as f32).sqrt()
             })
             .collect();
 
@@ -242,7 +250,7 @@ impl App {
                 let depth =
                     rescale(*dp, (0.0, 1.0), (0.0, height as f32)) as f64;
                 let colour = [0.0, 0.0, 1.0, 1.0];
-                let line = [col, 0.0, col, depth];
+                let line = [col, height, col, height-depth];
                 (colour, line)
             });
 
@@ -253,13 +261,10 @@ impl App {
                         (0.0, data.samples.len() as f32 - 1.0),
                         (0.0, width as f32),
                     ) as f64;
-                    let row = rescale(
-                        *dp,
-                        (-1.0, 1.0),
-                        (0.0, height as f32),
-                    ) as f64;
+                    let row =
+                        rescale(*dp, (-1.0, 1.0), (0.0, height as f32)) as f64;
                     let colour = [1.0, 0.0, 0.0, 1.0];
-                    let line = [col, row, col, height as f64/2.0];
+                    let line = [col, row, col, height as f64 / 2.0];
                     (colour, line)
                 });
 
