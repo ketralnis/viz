@@ -35,7 +35,11 @@ const FFT_SIZE: usize = FFT_SAMPLES / 2 - 1;
 const REACT_SAMPLES: usize = 512; // at 44khz, this is ~12ms
 
 // how many samples we consider to determine the current volume
-const VOLUME_SAMPLES: usize = 2048;
+const RECENT_VOLUME_SAMPLES: usize = 2048;
+const MAX_VOLUME_SAMPLES: usize = STORE_SAMPLES;
+
+type Line = [f64; 4];
+type Colour = [f32; 4];
 
 #[derive(Debug)]
 struct FftOutput {
@@ -86,7 +90,7 @@ impl AudioThread {
         event_loop: EventLoop,
         fft_sender: mpsc::SyncSender<Vec<f32>>,
     ) {
-        let mut samples: Vec<f32> = vec![0f32; STORE_SAMPLES];
+        let mut samples: Vec<f32> = vec![0.0; STORE_SAMPLES];
         let mut idx = 0;
         let mut react = 0;
 
@@ -119,7 +123,7 @@ impl AudioThread {
                     .collect(),
                 StreamData::Input {
                     buffer: UnknownTypeInputBuffer::F32(buf),
-                } => buf.iter().map(|b| *b as f32).collect(),
+                } => buf.to_vec(),
                 StreamData::Output { .. } => unreachable!("got output data?"),
             };
 
@@ -238,7 +242,7 @@ impl App {
         let (height, width) = (vp.window_size[1], vp.window_size[0]);
         let height = height as f64;
         let width = width as f64;
-        let lines: Vec<([f32; 4], [f64; 4])> = {
+        let lines: Vec<(Colour, Line)> = {
             let data = self.audio_thread.receiver.read().expect("read lock");
 
             let fft_lines = data.fft[1..].iter().enumerate().map(|(i, dp)| {
@@ -248,7 +252,7 @@ impl App {
                 let col = rescale(
                     i as f32,
                     (0.0, data.fft.len() as f32 - 1.0),
-                    (0f64, width as f64),
+                    (0.0, width),
                 );
                 let depth = rescale(*dp, (0.0, 1.0), (0.0, height));
                 let line = [col, height, col, height - depth];
@@ -260,53 +264,69 @@ impl App {
                     let col = rescale(
                         i as f32,
                         (0.0, data.samples.len() as f32 - 1.0),
-                        (0.0, width as f64),
+                        (0.0, width),
                     );
                     let row = rescale(*dp, (-1.0, 1.0), (0.0, height));
                     let line = [col, row, col, height / 2.0];
                     (rgb(0xd8, 0xac, 0x9c), line)
                 });
 
-            let heart_lines: Vec<([f32; 4], [f64; 4])> = {
-                let recent_volume = *&data.samples[data.samples.len()
-                    - VOLUME_SAMPLES
-                    ..data.samples.len() - 1]
-                    .iter()
-                    .copied()
-                    .fold(0.0f32, f32::max) as f64;
-                let scale_factor = f64::min(1.0, 2.0*recent_volume);
-                let margin_x = (
-                    width - width * (1.0 - scale_factor) / 2.0,
-                    width * (1.0 - scale_factor) / 2.0,
-                );
-                let margin_y = (
-                    height - height * (1.0 - scale_factor) / 2.0,
-                    height * (1.0 - scale_factor) / 2.0,
-                );
-                let heart_colour = rgb(114, 210, 200);
-                let heart_shape = parametric(
-                    |t| 16.0 * t.sin().powi(3),
-                    (-16.0, 16.0),
-                    margin_x,
-                    |t| {
-                        13.0 * t.cos()
-                            - 5.0 * (2.0 * t).cos()
-                            - 2.0 * (3.0 * t).cos()
-                            - (4.0 * t).cos()
-                    },
-                    (-17.0, 12.0),
-                    margin_y,
-                    (-PI64, PI64, 0.1),
-                );
-                // add the colours
-                heart_shape.into_iter().map(|l| (heart_colour, l)).collect()
+            let heart_lines = {
+                let recent_volume =
+                    *&data.samples[data.samples.len() - RECENT_VOLUME_SAMPLES
+                        ..data.samples.len() - 1]
+                        .iter()
+                        .copied()
+                        .fold(0.0, f32::max) as f64;
+                let max_volume =
+                    *&data.samples[data.samples.len() - MAX_VOLUME_SAMPLES
+                        ..data.samples.len() - 1]
+                        .iter()
+                        .copied()
+                        .fold(0.0, f32::max) as f64;
+
+                let mut ls: Vec<(Colour, Line)> = Vec::new();
+                let big_colour = rgb(114, 210, 200);
+                let little_colour = rgb(114 / 2, 210 / 2, 200 / 2);
+
+                for (colour, vol) in
+                    [(little_colour, recent_volume), (big_colour, max_volume)]
+                        .iter()
+                {
+                    let scale_factor = f64::min(1.0, 2.0 * vol);
+                    let margin_x = (
+                        width - width * (1.0 - scale_factor) / 2.0,
+                        width * (1.0 - scale_factor) / 2.0,
+                    );
+                    let margin_y = (
+                        height - height * (1.0 - scale_factor) / 2.0,
+                        height * (1.0 - scale_factor) / 2.0,
+                    );
+                    let mut heart_shape = parametric(
+                        |t| 16.0 * t.sin().powi(3),
+                        (-16.0, 16.0),
+                        margin_x,
+                        |t| {
+                            13.0 * t.cos()
+                                - 5.0 * (2.0 * t).cos()
+                                - 2.0 * (3.0 * t).cos()
+                                - (4.0 * t).cos()
+                        },
+                        (-17.0, 12.0),
+                        margin_y,
+                        (-PI64, PI64, 0.1),
+                        *colour,
+                    );
+                    ls.append(&mut heart_shape);
+                }
+                ls
             };
 
             fft_lines.chain(sample_lines).chain(heart_lines).collect()
         };
 
         self.gl.draw(vp, |c, gl| {
-            const BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+            const BLACK: Colour = [0.0, 0.0, 0.0, 1.0];
             graphics::clear(BLACK, gl);
             for (colour, line) in lines {
                 graphics::line(colour, 1.0, line, c.transform, gl)
@@ -356,7 +376,8 @@ fn parametric<X, Y>(
     y_expected_range: (f64, f64),
     y_output_range: (f64, f64),
     t_range_step: (f64, f64, f64),
-) -> Vec<[f64; 4]>
+    colour: Colour,
+) -> Vec<(Colour, Line)>
 where
     X: Fn(f64) -> f64,
     Y: Fn(f64) -> f64,
@@ -381,7 +402,7 @@ where
             }
             Some((last_x, last_y)) => {
                 last = Some((x, y));
-                ret.push([last_x, last_y, x, y]);
+                ret.push((colour, [last_x, last_y, x, y]));
             }
         }
 
@@ -390,9 +411,9 @@ where
 
     // close the shape
     if ret.len() > 1 {
-        let [start_x, start_y, _, _] = ret[0];
-        let [_, _, end_x, end_y] = ret[ret.len() - 1];
-        ret.push([start_x, start_y, end_x, end_y]);
+        let (_colour, [start_x, start_y, _, _]) = ret[0];
+        let (_colour, [_, _, end_x, end_y]) = ret[ret.len() - 1];
+        ret.push((colour, [start_x, start_y, end_x, end_y]));
     }
 
     ret
@@ -424,6 +445,6 @@ fn test_rescale() {
     assert_eq!(rescale(0.25, (-1f32, 1f32), (1f32, -1f32)), -0.25);
 }
 
-fn rgb(r: u8, g: u8, b: u8) -> [f32; 4] {
+fn rgb(r: u8, g: u8, b: u8) -> Colour {
     [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
 }
