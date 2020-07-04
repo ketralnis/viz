@@ -32,7 +32,10 @@ const FFT_SAMPLES: usize = 16384;
 const FFT_SIZE: usize = FFT_SAMPLES / 2 - 1;
 
 // how often to rerun the fft
-const REACT_SAMPLES: u32 = 512; // at 44khz, this is ~12ms
+const REACT_SAMPLES: usize = 512; // at 44khz, this is ~12ms
+
+// how many samples we consider to determine the current volume
+const VOLUME_SAMPLES: usize = 1024;
 
 #[derive(Debug)]
 struct FftOutput {
@@ -260,27 +263,44 @@ impl App {
                         (0.0, width as f64),
                     );
                     let row = rescale(*dp, (-1.0, 1.0), (0.0, height));
-                    let line = [col, row, col, height/ 2.0];
+                    let line = [col, row, col, height / 2.0];
                     (rgb(0xd8, 0xac, 0x9c), line)
                 });
 
             let heart_lines: Vec<([f32; 4], [f64; 4])> = {
-                let scale_factor = data.samples[data.samples.len() - 1] as f64 * 5.0;
+                let recent_volume = *&data.samples[data.samples.len()
+                    - VOLUME_SAMPLES
+                    ..data.samples.len() - 1]
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, f32::max) as f64;
+                let scale_factor = 2.0*recent_volume;
+                //let scale_factor = recent_volume
+                //    -data.samples[data.samples.len() - 1].abs() as f64 * 5.0;
+                let margin_x = (
+                    width - width * (1.0 - scale_factor) / 2.0,
+                    width * (1.0 - scale_factor) / 2.0,
+                );
+                let margin_y = (
+                    height - height * (1.0 - scale_factor) / 2.0,
+                    height * (1.0 - scale_factor) / 2.0,
+                );
                 let heart_colour = rgb(114, 210, 200);
                 let heart_shape = parametric(
-                    |t: f64| 16.0 * t.sin().powi(3),
+                    |t| 16.0 * t.sin().powi(3),
                     (-16.0, 16.0),
-                    (0.0, scale_factor * width),
-                    |t: f64| {
+                    margin_x,
+                    |t| {
                         13.0 * t.cos()
                             - 5.0 * (2.0 * t).cos()
                             - 2.0 * (3.0 * t).cos()
                             - (4.0 * t).cos()
                     },
-                    (12.0, -17.0),
-                    (0.0, scale_factor * height),
+                    (-17.0, 12.0),
+                    margin_y,
                     (-PI64, PI64, 0.1),
                 );
+                // add the colours
                 heart_shape.into_iter().map(|l| (heart_colour, l)).collect()
             };
 
