@@ -6,12 +6,14 @@ use fftw::plan::{C2CPlan, C2CPlan32};
 use fftw::types::{c32, Flag, Sign};
 use glutin_window::GlutinWindow as Window;
 use graphics;
+use num_traits::Float;
 use opengl_graphics::{GlGraphics, OpenGL};
 use piston::event_loop::{EventSettings, Events};
 use piston::input::{RenderArgs, RenderEvent, UpdateArgs, UpdateEvent};
 use piston::window::WindowSettings;
 
 use std::f32::consts::PI;
+use std::f64::consts::PI as PI64;
 use std::fmt::Debug;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
@@ -104,17 +106,13 @@ impl AudioThread {
                     buffer: UnknownTypeInputBuffer::U16(buf),
                 } => buf
                     .iter()
-                    .map(|b| {
-                        rescale(*b, (u16::MIN, u16::MAX), (-1.0f32, 1.0f32))
-                    })
+                    .map(|b| rescale(*b, (u16::MIN, u16::MAX), (-1.0, 1.0)))
                     .collect(),
                 StreamData::Input {
                     buffer: UnknownTypeInputBuffer::I16(buf),
                 } => buf
                     .iter()
-                    .map(|b| {
-                        rescale(*b, (i16::MIN, i16::MAX), (-1.0f32, 1.0f32))
-                    })
+                    .map(|b| rescale(*b, (i16::MIN, i16::MAX), (-1.0, 1.0)))
                     .collect(),
                 StreamData::Input {
                     buffer: UnknownTypeInputBuffer::F32(buf),
@@ -235,6 +233,8 @@ impl App {
         // lines we need to draw and then release it while we draw them
         let vp = args.viewport();
         let (height, width) = (vp.window_size[1], vp.window_size[0]);
+        let height = height as f64;
+        let width = width as f64;
         let lines: Vec<([f32; 4], [f64; 4])> = {
             let data = self.audio_thread.receiver.read().expect("read lock");
 
@@ -244,14 +244,12 @@ impl App {
                 // pixels we have
                 let col = rescale(
                     i as f32,
-                    (0f32, data.fft.len() as f32 - 1f32),
-                    (0f32, width as f32),
-                ) as f64;
-                let depth =
-                    rescale(*dp, (0.0, 1.0), (0.0, height as f32)) as f64;
-                const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+                    (0.0, data.fft.len() as f32 - 1.0),
+                    (0f64, width as f64),
+                );
+                let depth = rescale(*dp, (0.0, 1.0), (0.0, height));
                 let line = [col, height, col, height - depth];
-                (BLUE, line)
+                (rgb(0, 0, 255), line)
             });
 
             let sample_lines =
@@ -259,52 +257,31 @@ impl App {
                     let col = rescale(
                         i as f32,
                         (0.0, data.samples.len() as f32 - 1.0),
-                        (0.0, width as f32),
-                    ) as f64;
-                    let row =
-                        rescale(*dp, (-1.0, 1.0), (0.0, height as f32)) as f64;
-                    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
-                    let line = [col, row, col, height as f64 / 2.0];
-                    (RED, line)
+                        (0.0, width as f64),
+                    );
+                    let row = rescale(*dp, (-1.0, 1.0), (0.0, height));
+                    let line = [col, row, col, height/ 2.0];
+                    (rgb(0xd8, 0xac, 0x9c), line)
                 });
 
-            let heart_lines = {
-                // https://mathworld.wolfram.com/HeartCurve.html
-                let heart_x = |t: f32| 16.0 * t.sin().powi(3);
-                let heart_y = |t: f32| {
-                    13.0 * t.cos()
-                        - 5.0 * (2.0 * t).cos()
-                        - 2.0 * (3.0 * t).cos()
-                        - (4.0 * t).cos()
-                };
-                let scale_factor =
-                    data.samples[data.samples.len() - 1].abs();
-                const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
-                const RESOLUTION: u32 = 360;
-                let mut heart_lines = Vec::with_capacity(RESOLUTION as usize);
-                for t in 0..RESOLUTION {
-                    let t: f32 =
-                        rescale(t as f32, (0.0, RESOLUTION as f32), (-PI, PI));
-                    let x = heart_x(t);
-                    let y = heart_y(t);
-
-                    // that produces values on x=(-16..16) and y=(-17..12)
-                    let rx = rescale(
-                        x,
-                        (-16.0, 16.0),
-                        (0.0, width as f32 * scale_factor),
-                    ) as f64;
-                    let ry = rescale(
-                        y,
-                        (12.0, -17.0),
-                        (0.0, height as f32 * scale_factor),
-                    ) as f64;
-
-                    let line = [rx, ry, rx+1.0, ry+1.0];
-                    heart_lines.push((GREEN, line));
-                }
-                dbg!(heart_lines.clone());
-                heart_lines
+            let heart_lines: Vec<([f32; 4], [f64; 4])> = {
+                let scale_factor = data.samples[data.samples.len() - 1] as f64 * 5.0;
+                let heart_colour = rgb(114, 210, 200);
+                let heart_shape = parametric(
+                    |t: f64| 16.0 * t.sin().powi(3),
+                    (-16.0, 16.0),
+                    (0.0, scale_factor * width),
+                    |t: f64| {
+                        13.0 * t.cos()
+                            - 5.0 * (2.0 * t).cos()
+                            - 2.0 * (3.0 * t).cos()
+                            - (4.0 * t).cos()
+                    },
+                    (12.0, -17.0),
+                    (0.0, scale_factor * height),
+                    (-PI64, PI64, 0.1),
+                );
+                heart_shape.into_iter().map(|l| (heart_colour, l)).collect()
             };
 
             fft_lines.chain(sample_lines).chain(heart_lines).collect()
@@ -353,17 +330,71 @@ fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+fn parametric<X, Y>(
+    x_fn: X,
+    x_expected_range: (f64, f64),
+    x_output_range: (f64, f64),
+    y_fn: Y,
+    y_expected_range: (f64, f64),
+    y_output_range: (f64, f64),
+    t_range_step: (f64, f64, f64),
+) -> Vec<[f64; 4]>
+where
+    X: Fn(f64) -> f64,
+    Y: Fn(f64) -> f64,
+{
+    let (start_range, end_range, step) = t_range_step;
+
+    let mut ret =
+        Vec::with_capacity(((end_range - start_range) / step).ceil() as usize);
+
+    let mut t = start_range;
+    let mut last = None;
+    while t < end_range {
+        let x = x_fn(t);
+        let y = y_fn(t);
+
+        let x = rescale(x, x_expected_range, x_output_range);
+        let y = rescale(y, y_expected_range, y_output_range);
+
+        match last {
+            None => {
+                last = Some((x, y));
+            }
+            Some((last_x, last_y)) => {
+                last = Some((x, y));
+                ret.push([last_x, last_y, x, y]);
+            }
+        }
+
+        t += step;
+    }
+
+    // close the shape
+    if ret.len() > 1 {
+        let [start_x, start_y, _, _] = ret[0];
+        let [_, _, end_x, end_y] = ret[ret.len() - 1];
+        ret.push([start_x, start_y, end_x, end_y]);
+    }
+
+    ret
+}
+
 fn rescale<F, T>(num: F, from_range: (F, F), to_range: (T, T)) -> T
 where
-    F: Into<f32> + Copy + PartialOrd + Debug,
-    T: Into<f32> + From<f32> + Copy + Debug,
+    F: Into<T>,
+    T: Float + From<F>,
 {
+    // get the type conversions out of the way
     let (from_min, from_max) = from_range;
-    let from_span: f32 = from_max.into() - from_min.into();
-    let percent: f32 = (num.into() - from_min.into()) / from_span;
+    let (from_min, from_max): (T, T) = (from_min.into(), from_max.into());
+    let num: T = num.into();
+
+    let from_span: T = from_max - from_min;
+    let percent: T = (num - from_min) / from_span;
     let (to_min, to_max) = to_range;
-    let to_span: f32 = to_max.into() - to_min.into();
-    let output = (percent * to_span + to_min.into()).into();
+    let to_span: T = to_max - to_min;
+    let output = percent * to_span + to_min;
     output
 }
 
@@ -373,4 +404,8 @@ fn test_rescale() {
     assert_eq!(rescale(0.5, (-1f32, 1f32), (0f32, 1f32)), 0.75);
     assert_eq!(rescale(0.5, (-1f32, 1f32), (0f32, 200f32)), 150f32);
     assert_eq!(rescale(0.25, (-1f32, 1f32), (1f32, -1f32)), -0.25);
+}
+
+fn rgb(r: u8, g: u8, b: u8) -> [f32; 4] {
+    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
 }
