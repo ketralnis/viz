@@ -4,12 +4,10 @@ use cpal::{EventLoop, StreamData, UnknownTypeInputBuffer};
 use fftw::array::AlignedVec;
 use fftw::plan::{C2CPlan, C2CPlan32};
 use fftw::types::{c32, Flag, Sign};
-use glutin_window::GlutinWindow as Window;
 use graphics;
 use num_traits::Float;
-use opengl_graphics::{GlGraphics, OpenGL};
-use piston::event_loop::{EventSettings, Events};
-use piston::input::{RenderArgs, RenderEvent, UpdateArgs, UpdateEvent};
+use glium_graphics::{GliumWindow, OpenGL, Glium2d};
+use piston::input::{RenderArgs, RenderEvent};
 use piston::window::WindowSettings;
 
 use std::env::consts::OS;
@@ -227,16 +225,16 @@ impl AudioThread {
 }
 
 pub struct App {
-    gl: GlGraphics,
+    gl: Glium2d,
     audio_thread: AudioThread,
 }
 
 impl App {
-    fn new(gl: GlGraphics, audio_thread: AudioThread) -> Self {
+    fn new(gl: Glium2d, audio_thread: AudioThread) -> Self {
         Self { gl, audio_thread }
     }
 
-    fn render(&mut self, args: RenderArgs) {
+    fn render(&mut self, window: &mut GliumWindow, args: RenderArgs) {
         // we want to let go of that lock as fast as possible, so compute the
         // lines we need to draw and then release it while we draw them
         let vp = args.viewport();
@@ -264,7 +262,7 @@ impl App {
             // don't even have that many pixels. Instead, grab fewer of them.
             // That might mean that we miss all of the negative samples, so draw
             // them symmetrically to compensate
-            let samples_step = 4;
+            let samples_step = 10;
 
             let sample_lines =
                 data.samples.iter().step_by(samples_step).enumerate().map(
@@ -339,16 +337,16 @@ impl App {
             fft_lines.chain(sample_lines).chain(heart_lines).collect()
         };
 
-        self.gl.draw(vp, |c, gl| {
+        let mut target = window.draw();
+        self.gl.draw(&mut target, vp, move |c, gl| {
             const BLACK: Colour = [0.0, 0.0, 0.0, 1.0];
             graphics::clear(BLACK, gl);
             for (colour, line) in lines {
                 graphics::line(colour, 1.0, line, c.transform, gl)
             }
         });
+        target.finish().unwrap();
     }
-
-    fn update(&mut self, _args: UpdateArgs) {}
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -361,25 +359,20 @@ fn main() -> Result<(), anyhow::Error> {
         _ => OpenGL::V2_1,
     };
     dbg!(&opengl);
-    let mut window: Window =
-        WindowSettings::new("noise", [row_px as u32, col_px as u32])
-            .graphics_api(opengl)
-            .exit_on_esc(true)
-            .build()
-            .expect("failed to build window");
+    let mut window: GliumWindow = WindowSettings::new(
+        "noise",
+        [row_px as u32, col_px as u32])
+    .exit_on_esc(true)
+    .graphics_api(opengl)
+    .build().unwrap();
 
-    let mut app = App::new(GlGraphics::new(opengl), audio_thread);
+    let mut g2d = Glium2d::new(opengl, &window);
+    let mut app = App::new(g2d, audio_thread);
 
-    let mut settings = EventSettings::new();
-    settings.max_fps = FPS;
-    let mut events = Events::new(settings);
     // handle UI events on the main thread
-    while let Some(e) = events.next(&mut window) {
+    while let Some(e) = window.next() {
         if let Some(args) = e.render_args() {
-            app.render(args);
-        }
-        if let Some(args) = e.update_args() {
-            app.update(args);
+            app.render(&mut window, args);
         }
     }
 
