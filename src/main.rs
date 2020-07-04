@@ -35,7 +35,7 @@ const FFT_SIZE: usize = FFT_SAMPLES / 2 - 1;
 const REACT_SAMPLES: usize = 512; // at 44khz, this is ~12ms
 
 // how many samples we consider to determine the current volume
-const VOLUME_SAMPLES: usize = 1024;
+const VOLUME_SAMPLES: usize = 2048;
 
 #[derive(Debug)]
 struct FftOutput {
@@ -274,9 +274,7 @@ impl App {
                     .iter()
                     .copied()
                     .fold(0.0f32, f32::max) as f64;
-                let scale_factor = 2.0*recent_volume;
-                //let scale_factor = recent_volume
-                //    -data.samples[data.samples.len() - 1].abs() as f64 * 5.0;
+                let scale_factor = f64::min(1.0, 2.0*recent_volume);
                 let margin_x = (
                     width - width * (1.0 - scale_factor) / 2.0,
                     width * (1.0 - scale_factor) / 2.0,
