@@ -1,8 +1,16 @@
+
+
 * install rustup
 * copy over with rsync -rav ~/Dropbox/src/qq/viz pi@raspberrypi.local: --exclude
 target --exclude Cargo.lock --exclude .git
 * install libasound2-dev
+* run audio-hat/install-1.sh. reboot. run audio-hat/install-2.sh
 * cd ~/viz && cargo build --release (takes ~15mins)
 * cd ~/viz && cargo build --release && sudo RUST_BACKTRACE=1 xinit `pwd`/target/release/viz
 might need alsamixer adjustment?
 put ^ in /etc/rc.local
+
+test with
+rsync -rav ~/Dropbox/src/qq/viz pi@raspberrypi.local: --exclude target --exclude Cargo.lock --exclude .git && ssh -t pi@raspberrypi.local 'cd viz && ~/.cargo/bin/cargo build --release && sudo RUST_BACKTRACE=1 xinit `pwd`/target/release/viz'
+
+put "setterm -blank 0 -powerdown 0" in /etc/rc.local

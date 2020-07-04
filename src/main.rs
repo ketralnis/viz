@@ -17,6 +17,10 @@ use std::env::consts::OS;
 use std::f32::consts::PI;
 use std::f64::consts::PI as PI64;
 use std::fmt::Debug;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::Path;
+use std::process::Command;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -362,8 +366,23 @@ fn main() -> Result<(), anyhow::Error> {
 
     let mut app = App::new(GlGraphics::new(opengl), audio_thread);
 
+    let support_gpio = Path::new("/sys/class/gpio").exists();
+    if support_gpio {
+        // configure it
+        if !Path::new("/sys/class/gpio/gpio23").exists() {
+            let mut export_file = File::create("/sys/class/gpio/export")?;
+            export_file.write_all(b"23\n")?;
+            let mut direction_file =
+                File::create("/sys/class/gpio/gpio23/direction")?;
+            direction_file.write_all(b"in\n")?;
+        }
+    }
+
     let mut settings = EventSettings::new();
     settings.max_fps = FPS;
+    if support_gpio {
+        settings.ups = 15;
+    }
     let mut events = Events::new(settings);
     // handle UI events on the main thread
     while let Some(e) = events.next(&mut window) {
@@ -371,6 +390,16 @@ fn main() -> Result<(), anyhow::Error> {
             app.render(args);
         }
         if let Some(args) = e.update_args() {
+            if support_gpio {
+                let mut contents = Vec::new();
+                File::open(Path::new("/sys/class/gpio/gpio23/value"))?
+                    .read_to_end(&mut contents)?;
+                if contents.len() >= 1 && contents[0] == '0' as u8 {
+                    Command::new("/sbin/halt")
+                        .output()
+                        .expect("failed to halt");
+                }
+            }
             app.update(args);
         }
     }
