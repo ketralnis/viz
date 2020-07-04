@@ -12,6 +12,7 @@ use piston::event_loop::{EventSettings, Events};
 use piston::input::{RenderArgs, RenderEvent, UpdateArgs, UpdateEvent};
 use piston::window::WindowSettings;
 
+use std::env::consts::OS;
 use std::f32::consts::PI;
 use std::f64::consts::PI as PI64;
 use std::fmt::Debug;
@@ -259,27 +260,40 @@ impl App {
                 (rgb(0, 0, 255), line)
             });
 
+            // performance hack: we're trying to draw over 10k samples but we
+            // don't even have that many pixels. Instead, grab fewer of them.
+            // That might mean that we miss all of the negative samples, so draw
+            // them symmetrically to compensate
+            let samples_step = 4;
+
             let sample_lines =
-                data.samples.iter().enumerate().map(|(i, dp)| {
-                    let col = rescale(
-                        i as f32,
-                        (0.0, data.samples.len() as f32 - 1.0),
-                        (0.0, width),
-                    );
-                    let row = rescale(*dp, (-1.0, 1.0), (0.0, height));
-                    let line = [col, row, col, height / 2.0];
-                    (rgb(0xd8, 0xac, 0x9c), line)
-                });
+                data.samples.iter().step_by(samples_step).enumerate().map(
+                    |(i, dp)| {
+                        let col = rescale(
+                            i as f32,
+                            (
+                                0.0,
+                                data.samples.len() as f32 / samples_step as f32
+                                    - 1.0,
+                            ),
+                            (0.0, width),
+                        );
+                        let row = rescale(*dp, (0.0, 1.0), (0.0, height / 2.0));
+                        let line =
+                            [col, height / 2.0 - row, col, height / 2.0 + row];
+                        (rgb(0xd8, 0xac, 0x9c), line)
+                    },
+                );
 
             let heart_lines = {
                 let recent_volume =
-                    *&data.samples[data.samples.len() - RECENT_VOLUME_SAMPLES
+                    data.samples[data.samples.len() - RECENT_VOLUME_SAMPLES
                         ..data.samples.len() - 1]
                         .iter()
                         .copied()
                         .fold(0.0, f32::max) as f64;
                 let max_volume =
-                    *&data.samples[data.samples.len() - MAX_VOLUME_SAMPLES
+                    data.samples[data.samples.len() - MAX_VOLUME_SAMPLES
                         ..data.samples.len() - 1]
                         .iter()
                         .copied()
@@ -342,7 +356,11 @@ fn main() -> Result<(), anyhow::Error> {
 
     let audio_thread = AudioThread::new()?;
 
-    let opengl = OpenGL::V3_2;
+    let opengl = match OS {
+        "macos" => OpenGL::V3_2,
+        _ => OpenGL::V2_1,
+    };
+    dbg!(&opengl);
     let mut window: Window =
         WindowSettings::new("noise", [row_px as u32, col_px as u32])
             .graphics_api(opengl)

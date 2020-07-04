@@ -1,1 +1,2 @@
 let_and_return = false
+single_component_path_imports = false
