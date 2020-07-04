@@ -31,12 +31,6 @@ const WINDOW_SIZE: (usize, usize) = (800, 480);
 const STORE_SAMPLES: usize = 65536; // at 44khz, this is ~743ms
 const FFT_SAMPLES: usize = 16384;
 
-// performance hack: we're trying to draw over 10k samples but we
-// don't even have that many pixels. Instead, grab fewer of them.
-// An even number might mean that we bias towards only positive
-// samples, so draw them symmetrically to compensate
-const SUB_SAMPLES: usize = 2;
-
 // for a real input signal (imaginary parts all zero) the second half of the FFT
 // (bins from N / 2 + 1 to N - 1) contain no useful additional information (they
 // have complex conjugate symmetry with the first N / 2 - 1 bins). The last
@@ -56,7 +50,6 @@ type Colour = [f32; 4];
 #[derive(Debug)]
 struct FftOutput {
     samples: Vec<f32>,
-    sub: usize,
     fft: Vec<f32>,
 }
 
@@ -64,7 +57,6 @@ impl FftOutput {
     fn new() -> Self {
         Self {
             samples: vec![0.0; STORE_SAMPLES],
-            sub: 0,
             fft: vec![0.0; FFT_SIZE],
         }
     }
@@ -102,12 +94,11 @@ impl AudioThread {
 
     fn audio_thread(
         event_loop: EventLoop,
-        fft_sender: mpsc::SyncSender<(usize, Vec<f32>)>,
+        fft_sender: mpsc::SyncSender<Vec<f32>>,
     ) {
         let mut samples: Vec<f32> = vec![0.0; STORE_SAMPLES];
         let mut idx = 0;
         let mut react = 0;
-        let mut sub: usize = 0;
 
         event_loop.run(move |stream_id, stream_result| {
             // react to stream events and read or write stream data here
@@ -150,9 +141,6 @@ impl AudioThread {
                 react += 1;
                 react %= REACT_SAMPLES;
 
-                sub += 1;
-                sub %= SUB_SAMPLES;
-
                 if react == 0 {
                     // it's time to send an fft! the pointer is probably in the
                     // middle of the sample buffer but that represents a
@@ -163,7 +151,7 @@ impl AudioThread {
                         .chain(samples[..idx].iter())
                         .copied()
                         .collect();
-                    fft_sender.send((sub, it)).expect("fft thread hung up");
+                    fft_sender.send(it).expect("fft thread hung up");
                 }
             }
         });
@@ -171,7 +159,7 @@ impl AudioThread {
 
     fn fft_thread(
         receiver: Arc<RwLock<FftOutput>>,
-    ) -> mpsc::SyncSender<(usize, Vec<f32>)> {
+    ) -> mpsc::SyncSender<Vec<f32>> {
         // we don't want this to be unbounded because we want the audio thread
         // to block (and thus miss samples) when we get behind. but we do want
         // them to be able to run a bit in parallel
@@ -189,11 +177,10 @@ impl AudioThread {
                 )
                 .expect("couldn't plan fft");
 
-                for (sub, samples) in rx {
+                for samples in rx {
                     let fft = Self::compute_fft(
                         &mut input,
                         &mut output,
-                        sub,
                         samples,
                         &mut plan,
                     );
@@ -207,7 +194,6 @@ impl AudioThread {
     fn compute_fft<'a>(
         mut input_buffer: &mut AlignedVec<c32>,
         mut output_buffer: &mut AlignedVec<c32>,
-        sub: usize,
         samples: Vec<f32>,
         plan: &mut C2CPlan32,
     ) -> FftOutput {
@@ -235,7 +221,7 @@ impl AudioThread {
             })
             .collect();
 
-        FftOutput { samples, fft, sub }
+        FftOutput { samples, fft }
     }
 
     fn send_fft(output: FftOutput, receiver: &Arc<RwLock<FftOutput>>) {
@@ -259,6 +245,7 @@ impl App {
         // we want to let go of that lock as fast as possible, so compute the
         // lines we need to draw and then release it while we draw them
         let vp = args.viewport();
+        let [width, _height] = vp.window_size;
         let lines: Vec<(Colour, Line)> = {
             let data = self.audio_thread.receiver.read().expect("read lock");
 
@@ -276,22 +263,26 @@ impl App {
                 (rgb(0, 0, 255), line)
             });
 
-            let sample_lines = data
-                .samples
-                .iter()
-                .enumerate()
-                .skip(data.sub)
-                .step_by(SUB_SAMPLES)
-                .map(|(i, dp)| {
-                    let col = rescale(
-                        i as f32,
-                        (0.0, data.samples.len() as f32),
-                        (0.0, 1.0),
-                    );
-                    let row = rescale(*dp, (0.0, 1.0), (0.0, 0.5));
-                    let line = [col, 0.5 - row, col, 0.5 + row];
-                    (rgb(0xd8, 0xac, 0x9c), line)
-                });
+            // performance hack: we're trying to draw over 10k samples but we
+            // don't even have that many pixels. Instead, grab fewer of them.
+            // An even number might mean that we bias towards only positive
+            // samples, so draw them symmetrically to compensate
+            let samples_step =
+                (data.samples.len() as f64 / width.ceil()) as usize;
+
+            let sample_lines =
+                data.samples.iter().enumerate().step_by(samples_step).map(
+                    |(i, dp)| {
+                        let col = rescale(
+                            i as f32,
+                            (0.0, data.samples.len() as f32),
+                            (0.0, 1.0),
+                        );
+                        let row = rescale(*dp, (0.0, 1.0), (0.0, 0.5));
+                        let line = [col, 0.5 - row, col, 0.5 + row];
+                        (rgb(0xd8, 0xac, 0x9c), line)
+                    },
+                );
 
             let heart_lines = {
                 let recent_volume =
