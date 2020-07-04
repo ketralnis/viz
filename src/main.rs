@@ -11,14 +11,13 @@ use piston::event_loop::{EventSettings, Events};
 use piston::input::{RenderArgs, RenderEvent, UpdateArgs, UpdateEvent};
 use piston::window::WindowSettings;
 
-use std::f32::consts as f32_consts;
+use std::f32::consts::PI;
 use std::fmt::Debug;
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
 const FPS: u64 = 15;
-const UPS: u64 = 15;
 const WINDOW_SIZE: (usize, usize) = (640, 480);
 
 const STORE_SAMPLES: usize = 65536; // at 44khz, this is ~743ms
@@ -187,10 +186,11 @@ impl AudioThread {
         samples: Vec<f32>,
         plan: &mut C2CPlan32,
     ) -> FftOutput {
-        for (i, dp) in samples[STORE_SAMPLES-FFT_SAMPLES..].iter().enumerate() {
+        for (i, dp) in samples[STORE_SAMPLES - FFT_SAMPLES..].iter().enumerate()
+        {
             // https://en.wikipedia.org/wiki/Window_function#Hann_and_Hamming_windows
             const A0: f32 = 0.53836;
-            const TAU: f32 = f32_consts::PI * 2.0;
+            const TAU: f32 = PI * 2.0;
             let hammed = dp
                 * (A0
                     - ((1.0 - A0)
@@ -249,9 +249,9 @@ impl App {
                 ) as f64;
                 let depth =
                     rescale(*dp, (0.0, 1.0), (0.0, height as f32)) as f64;
-                let colour = [0.0, 0.0, 1.0, 1.0];
-                let line = [col, height, col, height-depth];
-                (colour, line)
+                const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+                let line = [col, height, col, height - depth];
+                (BLUE, line)
             });
 
             let sample_lines =
@@ -263,12 +263,51 @@ impl App {
                     ) as f64;
                     let row =
                         rescale(*dp, (-1.0, 1.0), (0.0, height as f32)) as f64;
-                    let colour = [1.0, 0.0, 0.0, 1.0];
+                    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
                     let line = [col, row, col, height as f64 / 2.0];
-                    (colour, line)
+                    (RED, line)
                 });
 
-            fft_lines.chain(sample_lines).collect()
+            let heart_lines = {
+                // https://mathworld.wolfram.com/HeartCurve.html
+                let heart_x = |t: f32| 16.0 * t.sin().powi(3);
+                let heart_y = |t: f32| {
+                    13.0 * t.cos()
+                        - 5.0 * (2.0 * t).cos()
+                        - 2.0 * (3.0 * t).cos()
+                        - (4.0 * t).cos()
+                };
+                let scale_factor =
+                    data.samples[data.samples.len() - 1].abs();
+                const GREEN: [f32; 4] = [0.0, 1.0, 0.0, 1.0];
+                const RESOLUTION: u32 = 360;
+                let mut heart_lines = Vec::with_capacity(RESOLUTION as usize);
+                for t in 0..RESOLUTION {
+                    let t: f32 =
+                        rescale(t as f32, (0.0, RESOLUTION as f32), (-PI, PI));
+                    let x = heart_x(t);
+                    let y = heart_y(t);
+
+                    // that produces values on x=(-16..16) and y=(-17..12)
+                    let rx = rescale(
+                        x,
+                        (-16.0, 16.0),
+                        (0.0, width as f32 * scale_factor),
+                    ) as f64;
+                    let ry = rescale(
+                        y,
+                        (12.0, -17.0),
+                        (0.0, height as f32 * scale_factor),
+                    ) as f64;
+
+                    let line = [rx, ry, rx+1.0, ry+1.0];
+                    heart_lines.push((GREEN, line));
+                }
+                dbg!(heart_lines.clone());
+                heart_lines
+            };
+
+            fft_lines.chain(sample_lines).chain(heart_lines).collect()
         };
 
         self.gl.draw(vp, |c, gl| {
@@ -300,7 +339,6 @@ fn main() -> Result<(), anyhow::Error> {
 
     let mut settings = EventSettings::new();
     settings.max_fps = FPS;
-    settings.ups = UPS;
     let mut events = Events::new(settings);
     // handle UI events on the main thread
     while let Some(e) = events.next(&mut window) {
@@ -322,21 +360,10 @@ where
 {
     let (from_min, from_max) = from_range;
     let from_span: f32 = from_max.into() - from_min.into();
-
     let percent: f32 = (num.into() - from_min.into()) / from_span;
-
     let (to_min, to_max) = to_range;
     let to_span: f32 = to_max.into() - to_min.into();
-
     let output = (percent * to_span + to_min.into()).into();
-
-    if cfg!(debug_assertions) && (num < from_min || num > from_max) {
-        eprintln!(
-            "rescale not happy about {:?} < {:?} < {:?} --> {:?} < {:?} < {:?}",
-            from_min, num, from_max, to_min, output, to_max,
-        );
-    }
-
     output
 }
 
