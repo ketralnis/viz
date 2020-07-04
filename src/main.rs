@@ -6,6 +6,7 @@ use fftw::plan::{C2CPlan, C2CPlan32};
 use fftw::types::{c32, Flag, Sign};
 use glutin_window::GlutinWindow as Window;
 use graphics;
+use graphics::Transformed;
 use num_traits::Float;
 use opengl_graphics::{GlGraphics, OpenGL};
 use piston::event_loop::{EventSettings, Events};
@@ -21,7 +22,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 
 const FPS: u64 = 30;
-const WINDOW_SIZE: (usize, usize) = (640, 480);
+const WINDOW_SIZE: (usize, usize) = (800, 480);
 
 const STORE_SAMPLES: usize = 65536; // at 44khz, this is ~743ms
 const FFT_SAMPLES: usize = 16384;
@@ -240,9 +241,7 @@ impl App {
         // we want to let go of that lock as fast as possible, so compute the
         // lines we need to draw and then release it while we draw them
         let vp = args.viewport();
-        let (height, width) = (vp.window_size[1], vp.window_size[0]);
-        let height = height as f64;
-        let width = width as f64;
+        let [width, _height] = vp.window_size;
         let lines: Vec<(Colour, Line)> = {
             let data = self.audio_thread.receiver.read().expect("read lock");
 
@@ -253,48 +252,42 @@ impl App {
                 let col = rescale(
                     i as f32,
                     (0.0, data.fft.len() as f32 - 1.0),
-                    (0.0, width),
+                    (0.0, 1.0),
                 );
-                let depth = rescale(*dp, (0.0, 1.0), (0.0, height));
-                let line = [col, height, col, height - depth];
+                let depth = *dp as f64; // already from 0.0 to 1.0
+                let line = [col, 1.0, col, 1.0 - depth];
                 (rgb(0, 0, 255), line)
             });
 
             // performance hack: we're trying to draw over 10k samples but we
             // don't even have that many pixels. Instead, grab fewer of them.
-            // That might mean that we miss all of the negative samples, so draw
-            // them symmetrically to compensate
-            let samples_step = 4;
+            // An even number might mean that we bias towards only positive
+            // samples, so draw them symmetrically to compensate
+            let samples_step =
+                (data.samples.len() as f64 / width.ceil()) as usize;
 
             let sample_lines =
-                data.samples.iter().step_by(samples_step).enumerate().map(
+                data.samples.iter().enumerate().step_by(samples_step).map(
                     |(i, dp)| {
                         let col = rescale(
                             i as f32,
-                            (
-                                0.0,
-                                data.samples.len() as f32 / samples_step as f32
-                                    - 1.0,
-                            ),
-                            (0.0, width),
+                            (0.0, data.samples.len() as f32),
+                            (0.0, 1.0),
                         );
-                        let row = rescale(*dp, (0.0, 1.0), (0.0, height / 2.0));
-                        let line =
-                            [col, height / 2.0 - row, col, height / 2.0 + row];
+                        let row = rescale(*dp, (0.0, 1.0), (0.0, 0.5));
+                        let line = [col, 0.5 - row, col, 0.5 + row];
                         (rgb(0xd8, 0xac, 0x9c), line)
                     },
                 );
 
             let heart_lines = {
                 let recent_volume =
-                    data.samples[data.samples.len() - RECENT_VOLUME_SAMPLES
-                        ..data.samples.len() - 1]
+                    data.samples[data.samples.len() - RECENT_VOLUME_SAMPLES..]
                         .iter()
                         .copied()
                         .fold(0.0, f32::max) as f64;
                 let max_volume =
-                    data.samples[data.samples.len() - MAX_VOLUME_SAMPLES
-                        ..data.samples.len() - 1]
+                    data.samples[data.samples.len() - MAX_VOLUME_SAMPLES..]
                         .iter()
                         .copied()
                         .fold(0.0, f32::max) as f64;
@@ -307,19 +300,15 @@ impl App {
                     [(little_colour, recent_volume), (big_colour, max_volume)]
                         .iter()
                 {
-                    let scale_factor = f64::min(1.0, 2.0 * vol);
-                    let margin_x = (
-                        width - width * (1.0 - scale_factor) / 2.0,
-                        width * (1.0 - scale_factor) / 2.0,
-                    );
-                    let margin_y = (
-                        height - height * (1.0 - scale_factor) / 2.0,
-                        height * (1.0 - scale_factor) / 2.0,
+                    let scale_factor = f64::min(1.0, 1.5 * vol);
+                    let margin = (
+                        1.0 - (1.0 - scale_factor) / 2.0,
+                        (1.0 - scale_factor) / 2.0,
                     );
                     let mut heart_shape = parametric(
                         |t| 16.0 * t.sin().powi(3),
                         (-16.0, 16.0),
-                        margin_x,
+                        margin,
                         |t| {
                             13.0 * t.cos()
                                 - 5.0 * (2.0 * t).cos()
@@ -327,8 +316,8 @@ impl App {
                                 - (4.0 * t).cos()
                         },
                         (-17.0, 12.0),
-                        margin_y,
-                        (-PI64, PI64, 0.1),
+                        margin,
+                        (-PI64, PI64, 0.05),
                         *colour,
                     );
                     ls.append(&mut heart_shape);
@@ -340,15 +329,19 @@ impl App {
         };
 
         self.gl.draw(vp, |c, gl| {
-            const BLACK: Colour = [0.0, 0.0, 0.0, 1.0];
-            graphics::clear(BLACK, gl);
+            let size = c.get_view_size();
+            let c = c.scale(size[0], size[1]);
+
+            let black = rgb(0, 0, 0);
+            graphics::clear(black, gl);
+
             for (colour, line) in lines {
-                graphics::line(colour, 1.0, line, c.transform, gl)
+                graphics::line(colour, 0.0015, line, c.transform, gl)
             }
         });
     }
 
-    fn update(&mut self, _args: UpdateArgs) {}
+    fn update(&self, _args: UpdateArgs) {}
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -360,7 +353,6 @@ fn main() -> Result<(), anyhow::Error> {
         "macos" => OpenGL::V3_2,
         _ => OpenGL::V2_1,
     };
-    dbg!(&opengl);
     let mut window: Window =
         WindowSettings::new("noise", [row_px as u32, col_px as u32])
             .graphics_api(opengl)
@@ -439,7 +431,6 @@ where
 
 fn rescale<F, T>(num: F, from_range: (F, F), to_range: (T, T)) -> T
 where
-    F: Into<T>,
     T: Float + From<F>,
 {
     // get the type conversions out of the way

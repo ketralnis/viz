@@ -1,10 +1,8 @@
-TODO: performance is terrible
-TODO: resize bug
-
 * install rustup
 * copy over with rsync -rav ~/Dropbox/src/qq/viz pi@raspberrypi.local: --exclude
 target --exclude Cargo.lock --exclude .git
 * install libasound2-dev
-* cargo build --release (takes ~15mins)
-* cargo build --release && sudo RUST_BACKTRACE=1 xinit `pwd`/target/release/viz
+* cd ~/viz && cargo build --release (takes ~15mins)
+* cd ~/viz && cargo build --release && sudo RUST_BACKTRACE=1 xinit `pwd`/target/release/viz
 might need alsamixer adjustment?
+put ^ in /etc/rc.local
