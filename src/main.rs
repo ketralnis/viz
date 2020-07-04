@@ -20,7 +20,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-const FPS: u64 = 15;
+const FPS: u64 = 30;
 const WINDOW_SIZE: (usize, usize) = (640, 480);
 
 const STORE_SAMPLES: usize = 65536; // at 44khz, this is ~743ms
