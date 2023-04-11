@@ -8,12 +8,12 @@ edition = "2018"
 
 [dependencies]
 cpal = "0.11"
-anyhow = "1.0.31"
-fftw = "0.6.2"
+anyhow = "1.0"
+fftw = "0.6"
 
-piston = "0.50.0"
-piston2d-graphics = "0.36.0"
-piston2d-opengl_graphics = "0.72.0"
-pistoncore-glutin_window = "0.64.0"
+piston = "0.50"
+piston2d-graphics = "0.36"
+piston2d-opengl_graphics = "0.72"
+pistoncore-glutin_window = "0.64"
 
-num-traits = "0.2.12"
+num-traits = "0.2"
